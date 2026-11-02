@@ -1,4 +1,5 @@
 import { Innertube, Platform } from "youtubei.js";
+import { resolveInvidiousTrack } from "./invidious";
 import { getPoToken, resetPoTokenProvider } from "./potoken";
 
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
@@ -238,7 +239,58 @@ export async function resolveTrack(
 
   const yt = await getInnertube();
 
-  const poToken = await fetchWithPoToken(yt, videoId);
+  let resolvedYoutube: Awaited<ReturnType<typeof fetchWithPoToken>> | null = null;
+
+  try {
+    resolvedYoutube = await fetchWithPoToken(yt, videoId);
+  } catch (error) {
+    console.warn("[youtube] all request strategies failed", videoId, error);
+  }
+
+  const youtubeStatus = resolvedYoutube?.info.playability_status?.status;
+  const youtubeFormats = (
+    resolvedYoutube?.info.streaming_data?.adaptive_formats ?? []
+  ).filter((format) => format.has_audio && !format.has_video);
+
+  if (!resolvedYoutube || youtubeStatus !== "OK" || youtubeFormats.length === 0) {
+    console.warn(
+      "[youtube] youtubei.js is unavailable, trying Invidious",
+      videoId,
+      youtubeStatus,
+      youtubeFormats.length,
+    );
+
+    const invidious = await resolveInvidiousTrack(videoId);
+
+    if (invidious) {
+      const entry: ResolvedTrack = {
+        info: invidious.info,
+        url: invidious.url,
+        cachedAt: Date.now(),
+      };
+      remember(videoId, entry);
+      return { ...entry, fromCache: false };
+    }
+
+    if (resolvedYoutube && youtubeStatus !== "OK") {
+      const reason = resolvedYoutube.info.playability_status?.reason;
+      if (reason) throw new ResolveError(reason, 422);
+    }
+
+    if (resolvedYoutube) {
+      throw new ResolveError(
+        "Không tìm thấy luồng âm thanh cho video này. Có thể video đang bị giới hạn.",
+        422,
+      );
+    }
+
+    throw new ResolveError(
+      "Không thể đọc thông tin video này. Vui lòng thử lại.",
+      502,
+    );
+  }
+
+  const poToken = resolvedYoutube;
 
   const info = poToken.info;
   const contentPoToken = poToken.token;
