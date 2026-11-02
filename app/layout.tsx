@@ -33,14 +33,32 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  themeColor: "#08080d",
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#f3f4fb" },
+    { media: "(prefers-color-scheme: dark)", color: "#08080d" },
+  ],
   width: "device-width",
   initialScale: 1,
 };
 
+const themeInitScript = `(function () {
+  try {
+    var stored = localStorage.getItem("theme");
+    var dark = stored
+      ? stored === "dark"
+      : !window.matchMedia("(prefers-color-scheme: light)").matches;
+    document.documentElement.classList.toggle("dark", dark);
+  } catch (e) {
+    document.documentElement.classList.add("dark");
+  }
+})();`;
+
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="vi">
+    <html lang="vi" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
+      </head>
       <body>{children}</body>
     </html>
   );

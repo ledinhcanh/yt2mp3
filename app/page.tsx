@@ -1,4 +1,5 @@
 import { Downloader } from "@/components/Downloader";
+import { ThemeToggle } from "@/components/ThemeToggle";
 import { SITE } from "@/lib/site";
 
 const steps = [
@@ -78,15 +79,18 @@ export default function HomePage() {
             </span>
           </a>
 
-          <nav className="nav-links" aria-label="Điều hướng chính">
-            <a href="#how">Cách hoạt động</a>
-            <a href="#faq">Câu hỏi thường gặp</a>
-            {SITE.repo ? (
-              <a href={SITE.repo} target="_blank" rel="noreferrer">
-                GitHub
-              </a>
-            ) : null}
-          </nav>
+          <div className="nav-actions">
+            <nav className="nav-links" aria-label="Điều hướng chính">
+              <a href="#how">Cách hoạt động</a>
+              <a href="#faq">Câu hỏi thường gặp</a>
+              {SITE.repo ? (
+                <a href={SITE.repo} target="_blank" rel="noreferrer">
+                  GitHub
+                </a>
+              ) : null}
+            </nav>
+            <ThemeToggle />
+          </div>
         </div>
       </header>
 

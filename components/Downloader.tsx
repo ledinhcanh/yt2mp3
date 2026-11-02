@@ -1,8 +1,14 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Mp3Encoder } from "@breezystack/lamejs";
 import { SITE } from "@/lib/site";
+
+const YOUTUBE_URL_RE =
+  /^(https?:\/\/)?((www|m|music)\.)?(youtube\.com\/(watch\?.*v=|shorts\/|live\/|embed\/)|youtu\.be\/)/i;
+
+function isYouTubeUrl(value: string): boolean {
+  return YOUTUBE_URL_RE.test(value.trim());
+}
 
 type Track = {
   videoId: string;
@@ -56,7 +62,8 @@ function sanitizeFilename(name: string): string {
   return cleaned.slice(0, 120) || "audio";
 }
 
-const AUDIO_CHUNK_SIZE = 3 * 1024 * 1024;
+const AUDIO_CHUNK_SIZE = 1024 * 1024;
+const AUDIO_CONCURRENCY = 5;
 
 async function readErrorMessage(response: Response): Promise<string> {
   let message = `Không tải được âm thanh (${response.status}).`;
@@ -88,20 +95,27 @@ async function fetchAudio(
     return new Uint8Array(buffer);
   }
 
-  const parts: Uint8Array[] = [];
+  const chunkCount = Math.ceil(total / AUDIO_CHUNK_SIZE);
+  const parts = new Array<Uint8Array | null>(chunkCount).fill(null);
   let received = 0;
   let streamTotal = total;
+  let failed: unknown = null;
+  let ended = false;
+  let nextIndex = 0;
 
-  for (let offset = 0; offset < streamTotal; offset += AUDIO_CHUNK_SIZE) {
-    const end = Math.min(offset + AUDIO_CHUNK_SIZE, streamTotal) - 1;
+  const fetchChunk = async (index: number) => {
+    const start = index * AUDIO_CHUNK_SIZE;
+    const end = Math.min(start + AUDIO_CHUNK_SIZE, streamTotal) - 1;
 
     const response = await fetch(audioUrl, {
       cache: "no-store",
-      headers: { Range: `bytes=${offset}-${end}` },
+      headers: { Range: `bytes=${start}-${end}` },
     });
 
-    // The server reports 416 when we ask beyond the end of the stream.
-    if (response.status === 416) break;
+    if (response.status === 416) {
+      ended = true;
+      return;
+    }
 
     if (!response.ok) throw new Error(await readErrorMessage(response));
 
@@ -109,20 +123,47 @@ async function fetchAudio(
     // few bytes from the size returned by the metadata endpoint.
     const contentRange = response.headers.get("content-range");
     const totalMatch = contentRange ? /\/(\d+)\s*$/.exec(contentRange) : null;
-    if (totalMatch) streamTotal = Number(totalMatch[1]);
+    if (totalMatch) {
+      streamTotal = Number(totalMatch[1]);
+      if (streamTotal < start) {
+        ended = true;
+        return;
+      }
+    }
 
     const data = new Uint8Array(await response.arrayBuffer());
-    if (data.length === 0) break;
+    if (data.length === 0) {
+      ended = true;
+      return;
+    }
 
-    parts.push(data);
+    parts[index] = data;
     received += data.length;
     onProgress(streamTotal > 0 ? Math.min(99, (received / streamTotal) * 100) : 99);
-  }
+  };
 
-  const output = new Uint8Array(received);
+  const workers = Array.from(
+    { length: Math.min(AUDIO_CONCURRENCY, chunkCount) },
+    async () => {
+      for (let index = nextIndex++; index < chunkCount && !failed && !ended; index = nextIndex++) {
+        try {
+          await fetchChunk(index);
+        } catch (error) {
+          failed = error;
+        }
+      }
+    },
+  );
+
+  await Promise.all(workers);
+
+  if (failed) throw failed;
+
+  const valid = parts.filter((part): part is Uint8Array => part !== null);
+  const output = new Uint8Array(valid.reduce((sum, part) => sum + part.length, 0));
   let position = 0;
 
-  for (const part of parts) {
+  for (const part of valid) {
     output.set(part, position);
     position += part.length;
   }
@@ -153,55 +194,69 @@ async function decodeAudio(bytes: Uint8Array): Promise<AudioBuffer> {
   }
 }
 
-function toInt16(input: Float32Array): Int16Array {
-  const output = new Int16Array(input.length);
+let mp3Worker: Worker | null = null;
+let rejectActiveEncode: ((error: Error) => void) | null = null;
+let encodeJobId = 0;
 
-  for (let i = 0; i < input.length; i += 1) {
-    const sample = Math.max(-1, Math.min(1, input[i]));
-    output[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-  }
+function getMp3Worker(): Worker {
+  if (mp3Worker) return mp3Worker;
 
-  return output;
+  mp3Worker = new Worker(new URL("./mp3-encoder.worker.ts", import.meta.url));
+  mp3Worker.onerror = () => {
+    rejectActiveEncode?.(new Error("Trình duyệt không thể chạy bộ mã hoá âm thanh."));
+    rejectActiveEncode = null;
+  };
+
+  return mp3Worker;
 }
 
-async function encodeMp3(
+function encodeMp3InWorker(
   buffer: AudioBuffer,
   bitrate: number,
   onProgress: (percent: number) => void,
 ): Promise<Blob> {
-  const channels = Math.min(2, buffer.numberOfChannels);
-  const encoder = new Mp3Encoder(channels, buffer.sampleRate, bitrate);
+  const worker = getMp3Worker();
+  const id = ++encodeJobId;
 
-  const left = toInt16(buffer.getChannelData(0));
-  const right = channels > 1 ? toInt16(buffer.getChannelData(1)) : null;
-
-  const blockSize = 1152;
-  const totalBlocks = Math.ceil(buffer.length / blockSize);
-  const chunks: BlobPart[] = [];
-  let blockIndex = 0;
-
-  for (let offset = 0; offset < buffer.length; offset += blockSize) {
-    const end = Math.min(offset + blockSize, buffer.length);
-    const encoded = right
-      ? encoder.encodeBuffer(left.subarray(offset, end), right.subarray(offset, end))
-      : encoder.encodeBuffer(left.subarray(offset, end));
-
-    if (encoded.length > 0) chunks.push(new Uint8Array(encoded).buffer);
-    blockIndex += 1;
-
-    if (blockIndex % 64 === 0) {
-      onProgress(Math.min(99, (blockIndex / totalBlocks) * 100));
-      await new Promise<void>((resolve) => {
-        window.setTimeout(resolve, 0);
-      });
-    }
+  const channelBuffers: ArrayBuffer[] = [];
+  for (let i = 0; i < Math.min(2, buffer.numberOfChannels); i += 1) {
+    channelBuffers.push(buffer.getChannelData(i).buffer);
   }
 
-  const tail = encoder.flush();
-  if (tail.length > 0) chunks.push(new Uint8Array(tail).buffer);
+  return new Promise<Blob>((resolve, reject) => {
+    const handleMessage = (event: MessageEvent) => {
+      const data = event.data as {
+        id?: number;
+        type?: string;
+        percent?: number;
+        buffer?: ArrayBuffer;
+        message?: string;
+      };
 
-  onProgress(100);
-  return new Blob(chunks, { type: "audio/mpeg" });
+      if (!data || data.id !== id) return;
+
+      if (data.type === "progress" && typeof data.percent === "number") {
+        onProgress(data.percent);
+        return;
+      }
+
+      worker.removeEventListener("message", handleMessage);
+      if (rejectActiveEncode === reject) rejectActiveEncode = null;
+
+      if (data.type === "done" && data.buffer) {
+        resolve(new Blob([data.buffer], { type: "audio/mpeg" }));
+      } else {
+        reject(new Error(data.message || "Không thể mã hoá MP3."));
+      }
+    };
+
+    rejectActiveEncode = reject;
+    worker.addEventListener("message", handleMessage);
+    worker.postMessage(
+      { id, sampleRate: buffer.sampleRate, bitrate, channels: channelBuffers },
+      channelBuffers,
+    );
+  });
 }
 
 function triggerDownload(blob: Blob, filename: string) {
@@ -235,14 +290,12 @@ export function Downloader() {
     track && track.duration > SITE.maxMp3DurationSeconds,
   );
 
-  async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-
+  async function convert(value: string) {
     if (busy) return;
 
-    const value = url.trim();
+    const trimmed = value.trim();
 
-    if (!value) {
+    if (!trimmed) {
       setError("Hãy dán link YouTube trước nhé.");
       return;
     }
@@ -256,7 +309,7 @@ export function Downloader() {
       const response = await fetch("/api/info", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: value }),
+        body: JSON.stringify({ url: trimmed }),
       });
 
       const data = (await response.json().catch(() => null)) as
@@ -275,13 +328,21 @@ export function Downloader() {
     }
   }
 
+  function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    void convert(url);
+  }
+
   async function handlePaste() {
     try {
       const text = await navigator.clipboard.readText();
 
       if (text) {
-        setUrl(text.trim());
+        const trimmed = text.trim();
+        setUrl(trimmed);
         setError(null);
+
+        if (isYouTubeUrl(trimmed)) void convert(trimmed);
       }
     } catch {
       setError("Trình duyệt không cho phép đọc clipboard. Hãy dán bằng Ctrl + V.");
@@ -314,7 +375,7 @@ export function Downloader() {
       const audioBuffer = await decodeAudio(bytes);
 
       setProgress({ label: "Đang mã hoá MP3...", percent: 65 });
-      const blob = await encodeMp3(audioBuffer, bitrate, (percent) => {
+      const blob = await encodeMp3InWorker(audioBuffer, bitrate, (percent) => {
         setProgress({
           label: "Đang mã hoá MP3...",
           percent: 65 + percent * 0.35,
@@ -401,6 +462,16 @@ export function Downloader() {
             spellCheck={false}
             value={url}
             onChange={(event) => setUrl(event.target.value)}
+            onPaste={(event) => {
+              const text = event.clipboardData.getData("text/plain");
+              if (!text) return;
+
+              event.preventDefault();
+              const trimmed = text.trim();
+              setUrl(trimmed);
+
+              if (isYouTubeUrl(trimmed)) void convert(trimmed);
+            }}
             placeholder="Dán link YouTube, ví dụ: https://youtu.be/dQw4w9WgXcQ"
             aria-label="Link YouTube"
             disabled={phase === "working"}
@@ -429,7 +500,8 @@ export function Downloader() {
       </div>
 
       <p className="input-hint">
-        Hỗ trợ youtube.com, youtu.be, YouTube Shorts và YouTube Music.
+        Hỗ trợ youtube.com, youtu.be, YouTube Shorts và YouTube Music. Dán link là tự động chuyển
+        đổi ngay.
       </p>
 
       {error && (
