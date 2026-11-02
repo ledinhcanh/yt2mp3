@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  serverExternalPackages: ["youtubei.js"],
+  serverExternalPackages: ["youtubei.js", "bgutils-js", "jsdom"],
   poweredByHeader: false,
 };
 

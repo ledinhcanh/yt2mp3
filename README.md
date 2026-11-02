@@ -21,6 +21,7 @@ Trình duyệt
   │  1. POST /api/info  (link YouTube)
   ▼
 Next.js API (Node runtime)
+  │  - tạo PO token (BotGuard) gắn với video
   │  - youtubei.js lấy metadata + URL âm thanh
   │  - giải mã chữ ký / tham số `n`
   ▼
@@ -41,6 +42,7 @@ Tải file .mp3 về máy
 
 - YouTube bóp băng thông các request tải liền mạch xuống ~30 KB/s. Gửi kèm header `Range` giúp tải nhanh gấp hàng chục lần.
 - File âm thanh được chia thành các chunk 3 MB khi tải để nằm dưới giới hạn response 4.5 MB của Vercel Functions.
+- Mỗi video được tạo một PO token riêng bằng BotGuard (qua `bgutils-js`) và gắn vào request player + URL stream để giảm lỗi “Sign in to confirm you're not a bot”.
 - Việc mã hoá MP3 diễn ra ở client nên server không cần ffmpeg và không lưu file.
 
 ## Chạy local
@@ -118,7 +120,8 @@ components/
   Downloader.tsx        # UI + tải audio + mã hoá MP3
 lib/
   site.ts               # cấu hình thương hiệu
-  youtube.ts            # youtubei.js, parse link, cache
+  potoken.ts            # tạo PO token bằng BotGuard (bgutils-js + jsdom)
+  youtube.ts            # youtubei.js, parse link, cache, fallback client
 ```
 
 ## API
@@ -160,7 +163,7 @@ curl -H "Range: bytes=0-1048575" "http://localhost:3000/api/audio?id=dQw4w9WgXcQ
 
 - **Video bị giới hạn / riêng tư / yêu cầu đăng nhập:** API trả lỗi 422 kèm lý do.
 - **YouTube thay đổi API:** chạy `npm update youtubei.js` để lấy bản mới. Đây là thư viện được cập nhật thường xuyên.
-- **Vercel bị YouTube chặn IP:** một số IP datacenter có thể bị YouTube hạn chế. Nếu gặp lỗi 403/410 hàng loạt, hãy thử deploy sang host khác hoặc thêm proxy outbound.
+- **Vercel bị YouTube chặn IP:** app đã tự tạo PO token và thử thêm client dự phòng (`ANDROID_VR`, `IOS`). Nếu vẫn gặp “Sign in to confirm you're not a bot”, IP datacenter đang bị YouTube chặn cứng — PO token không vượt được giới hạn IP. Khi đó cần dùng proxy/residential IP, cookie tài khoản (rủi ro bị ban), hoặc deploy lên host khác.
 - **Video dài:** chuyển MP3 trên trình duyệt cần giải mã toàn bộ PCM vào RAM. Mặc định giới hạn 15 phút; video dài hơn vẫn tải được bản gốc.
 - **Safari:** nếu giải mã file WebM/Opus thất bại, hãy dùng nút “Tải bản gốc” hoặc thử video khác.
 
@@ -168,6 +171,7 @@ curl -H "Range: bytes=0-1048575" "http://localhost:3000/api/audio?id=dQw4w9WgXcQ
 
 - Next.js 16 (App Router) + React 19 + TypeScript
 - [`youtubei.js`](https://github.com/LuanRT/YouTube.js) để lấy luồng âm thanh
+- [`bgutils-js`](https://github.com/LuanRT/BgUtils) + `jsdom` để tạo PO token (BotGuard)
 - Web Audio API + [`@breezystack/lamejs`](https://www.npmjs.com/package/@breezystack/lamejs) để mã hoá MP3 phía client
 - CSS thuần, không phụ thuộc UI framework
 

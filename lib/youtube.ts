@@ -1,4 +1,5 @@
 import { Innertube, Platform } from "youtubei.js";
+import { getPoToken, resetPoTokenProvider } from "./potoken";
 
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -124,6 +125,91 @@ function pickThumbnail(videoId: string, thumbnails: { url?: string; width?: numb
   return sorted[0]?.url ?? fallback;
 }
 
+type VideoInfo = Awaited<ReturnType<Innertube["getInfo"]>>;
+type ClientName = "MWEB" | "ANDROID_VR" | "IOS";
+
+const FALLBACK_CLIENTS: ClientName[] = ["ANDROID_VR", "IOS"];
+
+function isBotCheck(info: VideoInfo): boolean {
+  // The reason text is localized (lang: "vi"), so rely on the status instead.
+  return info.playability_status?.status === "LOGIN_REQUIRED";
+}
+
+function isPlayable(info: VideoInfo): boolean {
+  return info.playability_status?.status === "OK";
+}
+
+function requestInfo(
+  yt: Innertube,
+  videoId: string,
+  client: ClientName,
+  poToken: string | null,
+): Promise<VideoInfo> {
+  return yt.getInfo(videoId, {
+    client,
+    ...(poToken ? { po_token: poToken } : {}),
+  });
+}
+
+async function tryRequest(
+  yt: Innertube,
+  videoId: string,
+  client: ClientName,
+  poToken: string | null,
+): Promise<VideoInfo | null> {
+  try {
+    return await requestInfo(yt, videoId, client, poToken);
+  } catch (error) {
+    console.warn("[youtube] getInfo failed", videoId, client, error);
+    return null;
+  }
+}
+
+async function fetchWithPoToken(
+  yt: Innertube,
+  videoId: string,
+): Promise<{ info: VideoInfo; token: string | null }> {
+  let token = await getPoToken(videoId);
+  let info = await tryRequest(yt, videoId, "MWEB", token);
+
+  if (info && (isPlayable(info) || !isBotCheck(info))) {
+    return { info, token };
+  }
+
+  // A Web PO token may not be enough on flagged (datacenter) IPs. Generate a
+  // fresh token once, then fall back to clients that don't use Web tokens.
+  if (token) {
+    console.warn("[youtube] bot check detected, refreshing PO token", videoId);
+    resetPoTokenProvider();
+    token = await getPoToken(videoId);
+
+    if (token) {
+      const retry = await tryRequest(yt, videoId, "MWEB", token);
+      if (retry && (isPlayable(retry) || !isBotCheck(retry))) {
+        return { info: retry, token };
+      }
+      info = retry ?? info;
+    }
+  }
+
+  for (const client of FALLBACK_CLIENTS) {
+    const fallback = await tryRequest(yt, videoId, client, null);
+    if (fallback && isPlayable(fallback)) {
+      console.info("[youtube] using fallback client", videoId, client);
+      return { info: fallback, token: null };
+    }
+    if (fallback && !isBotCheck(fallback)) {
+      return { info: fallback, token: null };
+    }
+  }
+
+  if (info) {
+    return { info, token };
+  }
+
+  throw new ResolveError("Không thể đọc thông tin video này. Vui lòng thử lại.", 502);
+}
+
 function remember(videoId: string, entry: ResolvedTrack) {
   cache.delete(videoId);
   cache.set(videoId, entry);
@@ -152,13 +238,10 @@ export async function resolveTrack(
 
   const yt = await getInnertube();
 
-  let info: Awaited<ReturnType<Innertube["getInfo"]>>;
-  try {
-    info = await yt.getInfo(videoId, { client: "MWEB" });
-  } catch (error) {
-    console.error("[youtube] getInfo failed", videoId, error);
-    throw new ResolveError("Không thể đọc thông tin video này. Vui lòng thử lại.", 502);
-  }
+  const poToken = await fetchWithPoToken(yt, videoId);
+
+  const info = poToken.info;
+  const contentPoToken = poToken.token;
 
   const status = info.playability_status?.status;
   if (status !== "OK") {
@@ -197,6 +280,18 @@ export async function resolveTrack(
   }
 
   if (!mediaUrl) mediaUrl = chosen.url ?? "";
+
+  if (mediaUrl && contentPoToken) {
+    try {
+      const streamUrl = new URL(mediaUrl);
+      if (!streamUrl.searchParams.has("pot")) {
+        streamUrl.searchParams.set("pot", contentPoToken);
+        mediaUrl = streamUrl.toString();
+      }
+    } catch {
+      // Keep the original URL if it cannot be parsed.
+    }
+  }
 
   if (!mediaUrl) {
     throw new ResolveError("Không lấy được liên kết âm thanh từ YouTube. Vui lòng thử lại.", 502);
