@@ -163,7 +163,7 @@ curl -H "Range: bytes=0-1048575" "http://localhost:3000/api/audio?id=dQw4w9WgXcQ
 
 - **Video bị giới hạn / riêng tư / yêu cầu đăng nhập:** API trả lỗi 422 kèm lý do.
 - **YouTube thay đổi API:** chạy `npm update youtubei.js` để lấy bản mới. Đây là thư viện được cập nhật thường xuyên.
-- **Vercel bị YouTube chặn IP:** app đã tự tạo PO token và thử thêm client dự phòng (`ANDROID_VR`, `IOS`). Nếu vẫn gặp “Sign in to confirm you're not a bot”, IP datacenter đang bị YouTube chặn cứng — PO token không vượt được giới hạn IP. Khi đó cần dùng proxy/residential IP, cookie tài khoản (rủi ro bị ban), hoặc deploy lên host khác.
+- **Vercel bị YouTube chặn IP:** app tự tạo PO token, thử client dự phòng (`ANDROID_VR`, `IOS`) và cuối cùng chuyển sang Invidious khi YouTube trả `LOGIN_REQUIRED`. Instance công khai có thể chậm hoặc bị giới hạn; đặt biến môi trường `INVIDIOUS_INSTANCES` (danh sách URL cách nhau bởi dấu phẩy) để dùng instance riêng. Nếu vẫn lỗi, cần proxy/residential IP hoặc deploy lên host khác.
 - **Video dài:** chuyển MP3 trên trình duyệt cần giải mã toàn bộ PCM vào RAM. Mặc định giới hạn 15 phút; video dài hơn vẫn tải được bản gốc.
 - **Safari:** nếu giải mã file WebM/Opus thất bại, hãy dùng nút “Tải bản gốc” hoặc thử video khác.
 
@@ -171,6 +171,7 @@ curl -H "Range: bytes=0-1048575" "http://localhost:3000/api/audio?id=dQw4w9WgXcQ
 
 - Next.js 16 (App Router) + React 19 + TypeScript
 - [`youtubei.js`](https://github.com/LuanRT/YouTube.js) để lấy luồng âm thanh
+- Invidious API làm phương án dự phòng khi YouTube chặn IP datacenter
 - [`bgutils-js`](https://github.com/LuanRT/BgUtils) + `jsdom` để tạo PO token (BotGuard)
 - Web Audio API + [`@breezystack/lamejs`](https://www.npmjs.com/package/@breezystack/lamejs) để mã hoá MP3 phía client
 - CSS thuần, không phụ thuộc UI framework
