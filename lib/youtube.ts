@@ -5,6 +5,10 @@ import { getPoToken, resetPoTokenProvider } from "./potoken";
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const CACHE_MAX_ENTRIES = 50;
+const VISITOR_TTL_MS = 6 * 60 * 60 * 1000;
+const VISITOR_TIMEOUT_MS = 10_000;
+const BROWSER_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 export interface TrackInfo {
   videoId: string;
@@ -39,6 +43,8 @@ const cache = new Map<string, ResolvedTrack>();
 let platformReady = false;
 let innertubePromise: Promise<Innertube> | null = null;
 
+let visitorDataCache: { value: string | null; expiresAt: number } | null = null;
+
 function preparePlatform() {
   if (platformReady) return;
 
@@ -46,17 +52,64 @@ function preparePlatform() {
   platformReady = true;
 }
 
+/**
+ * Fetch a real visitor id from the YouTube homepage. YouTube only serves
+ * unthrottled media URLs to sessions backed by a genuine visitor id; locally
+ * generated sessions are limited to the first ~1 MiB of every stream, which
+ * makes any video longer than a few minutes fail with HTTP 403.
+ */
+async function getVisitorData(): Promise<string | null> {
+  if (visitorDataCache && visitorDataCache.expiresAt > Date.now()) {
+    return visitorDataCache.value;
+  }
+
+  let value: string | null = null;
+
+  try {
+    const response = await fetch("https://www.youtube.com/", {
+      headers: {
+        "User-Agent": BROWSER_UA,
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+      cache: "no-store",
+      signal: AbortSignal.timeout(VISITOR_TIMEOUT_MS),
+    });
+
+    if (response.ok) {
+      const html = await response.text();
+      const match =
+        /"visitorData":"([^"]+)"/.exec(html) ??
+        /VISITOR_DATA":"([^"]+)"/.exec(html);
+      value = match?.[1] ?? null;
+    }
+  } catch (error) {
+    console.warn("[youtube] failed to fetch visitor data", error);
+  }
+
+  visitorDataCache = {
+    value,
+    // Retry quickly after a failure instead of pinning a fake session for hours.
+    expiresAt: Date.now() + (value ? VISITOR_TTL_MS : 60_000),
+  };
+  return value;
+}
+
 export async function getInnertube(): Promise<Innertube> {
   preparePlatform();
 
   if (!innertubePromise) {
-    innertubePromise = Innertube.create({
-      retrieve_player: true,
-      generate_session_locally: true,
-      enable_session_cache: false,
-      lang: "vi",
-      location: "VN",
-    });
+    innertubePromise = (async () => {
+      const visitorData = await getVisitorData();
+
+      return Innertube.create({
+        retrieve_player: true,
+        generate_session_locally: !visitorData,
+        enable_session_cache: false,
+        lang: "vi",
+        location: "VN",
+        ...(visitorData ? { visitor_data: visitorData } : {}),
+      });
+    })();
 
     innertubePromise.catch(() => {
       innertubePromise = null;
@@ -127,9 +180,9 @@ function pickThumbnail(videoId: string, thumbnails: { url?: string; width?: numb
 }
 
 type VideoInfo = Awaited<ReturnType<Innertube["getInfo"]>>;
-type ClientName = "MWEB" | "ANDROID_VR" | "IOS";
+type ClientName = "VISIONOS" | "MWEB" | "IOS" | "ANDROID_VR";
 
-const FALLBACK_CLIENTS: ClientName[] = ["ANDROID_VR", "IOS"];
+const FALLBACK_CLIENTS: ClientName[] = ["IOS", "ANDROID_VR"];
 
 function isBotCheck(info: VideoInfo): boolean {
   // The reason text is localized (lang: "vi"), so rely on the status instead.
@@ -138,6 +191,12 @@ function isBotCheck(info: VideoInfo): boolean {
 
 function isPlayable(info: VideoInfo): boolean {
   return info.playability_status?.status === "OK";
+}
+
+function hasAudioFormats(info: VideoInfo): boolean {
+  return (info.streaming_data?.adaptive_formats ?? []).some(
+    (format) => format.has_audio && !format.has_video,
+  );
 }
 
 function requestInfo(
@@ -170,6 +229,14 @@ async function fetchWithPoToken(
   yt: Innertube,
   videoId: string,
 ): Promise<{ info: VideoInfo; token: string | null }> {
+  // VISIONOS doesn't need a PO token and, with a real visitor id, returns
+  // media URLs where every byte range is readable. That is what allows long
+  // videos to download; the web/mobile clients cap streams at ~1 MiB.
+  const visionos = await tryRequest(yt, videoId, "VISIONOS", null);
+  if (visionos && isPlayable(visionos) && hasAudioFormats(visionos)) {
+    return { info: visionos, token: null };
+  }
+
   let token = await getPoToken(videoId);
   let info = await tryRequest(yt, videoId, "MWEB", token);
 
@@ -195,17 +262,21 @@ async function fetchWithPoToken(
 
   for (const client of FALLBACK_CLIENTS) {
     const fallback = await tryRequest(yt, videoId, client, null);
-    if (fallback && isPlayable(fallback)) {
+    if (fallback && isPlayable(fallback) && hasAudioFormats(fallback)) {
       console.info("[youtube] using fallback client", videoId, client);
       return { info: fallback, token: null };
     }
     if (fallback && !isBotCheck(fallback)) {
-      return { info: fallback, token: null };
+      info = fallback;
     }
   }
 
   if (info) {
     return { info, token };
+  }
+
+  if (visionos) {
+    return { info: visionos, token: null };
   }
 
   throw new ResolveError("Không thể đọc thông tin video này. Vui lòng thử lại.", 502);

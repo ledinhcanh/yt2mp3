@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { SITE } from "@/lib/site";
+import { splitFragmentedMp4 } from "./mp4-segments";
 
 const YOUTUBE_URL_RE =
   /^(https?:\/\/)?((www|m|music)\.)?(youtube\.com\/(watch\?.*v=|shorts\/|live\/|embed\/)|youtu\.be\/)/i;
@@ -172,7 +173,7 @@ async function fetchAudio(
   return output;
 }
 
-async function decodeAudio(bytes: Uint8Array): Promise<AudioBuffer> {
+async function decodeAudio(bytes: Uint8Array, context?: AudioContext): Promise<AudioBuffer> {
   const AudioCtx =
     window.AudioContext ??
     (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
@@ -181,16 +182,17 @@ async function decodeAudio(bytes: Uint8Array): Promise<AudioBuffer> {
     throw new Error("Trình duyệt của bạn không hỗ trợ Web Audio API.");
   }
 
-  const context = new AudioCtx();
+  const ownsContext = !context;
+  const audioContext = context ?? new AudioCtx();
 
   try {
     const buffer = bytes.buffer.slice(
       bytes.byteOffset,
       bytes.byteOffset + bytes.byteLength,
     ) as ArrayBuffer;
-    return await context.decodeAudioData(buffer);
+    return await audioContext.decodeAudioData(buffer);
   } finally {
-    await context.close().catch(() => undefined);
+    if (ownsContext) await audioContext.close().catch(() => undefined);
   }
 }
 
@@ -259,6 +261,51 @@ function encodeMp3InWorker(
   });
 }
 
+const AUDIO_SEGMENT_BYTES = 4 * 1024 * 1024;
+
+async function encodeAudioToMp3(
+  bytes: Uint8Array,
+  sourceFormat: "aac" | "opus",
+  bitrate: number,
+  onProgress: (percent: number) => void,
+): Promise<Blob> {
+  if (sourceFormat === "aac") {
+    const segments = splitFragmentedMp4(bytes, AUDIO_SEGMENT_BYTES);
+
+    if (segments && segments.length > 1) {
+      const AudioCtx =
+        window.AudioContext ??
+        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+
+      if (!AudioCtx) {
+        throw new Error("Trình duyệt của bạn không hỗ trợ Web Audio API.");
+      }
+
+      const context = new AudioCtx();
+      const parts: Blob[] = [];
+
+      try {
+        for (let index = 0; index < segments.length; index += 1) {
+          const audioBuffer = await decodeAudio(segments[index], context);
+          const blob = await encodeMp3InWorker(audioBuffer, bitrate, (percent) => {
+            const overall = ((index + percent / 100) / segments.length) * 100;
+            onProgress(Math.min(99, overall));
+          });
+          parts.push(blob);
+        }
+      } finally {
+        await context.close().catch(() => undefined);
+      }
+
+      onProgress(100);
+      return new Blob(parts, { type: "audio/mpeg" });
+    }
+  }
+
+  const audioBuffer = await decodeAudio(bytes);
+  return encodeMp3InWorker(audioBuffer, bitrate, onProgress);
+}
+
 function triggerDownload(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
@@ -287,7 +334,9 @@ export function Downloader() {
   }, [track, bitrate]);
 
   const tooLongForMp3 = Boolean(
-    track && track.duration > SITE.maxMp3DurationSeconds,
+    track &&
+      track.sourceFormat !== "aac" &&
+      track.duration > SITE.maxMp3DurationSeconds,
   );
 
   async function convert(value: string) {
@@ -354,7 +403,7 @@ export function Downloader() {
 
     if (tooLongForMp3) {
       setError(
-        `Video dài ${formatDuration(track.duration)}. Trình duyệt chỉ chuyển MP3 cho video dưới ${SITE.maxMp3DurationLabel} — hãy dùng "Tải bản gốc".`,
+        `Nguồn âm thanh của video này là Opus/WebM nên chưa thể chuyển MP3 cho video dài ${formatDuration(track.duration)}. Hãy thử một video khác.`,
       );
       return;
     }
@@ -371,11 +420,8 @@ export function Downloader() {
         });
       });
 
-      setProgress({ label: "Đang giải mã âm thanh...", percent: 58 });
-      const audioBuffer = await decodeAudio(bytes);
-
-      setProgress({ label: "Đang mã hoá MP3...", percent: 65 });
-      const blob = await encodeMp3InWorker(audioBuffer, bitrate, (percent) => {
+      setProgress({ label: "Đang giải mã âm thanh...", percent: 56 });
+      const blob = await encodeAudioToMp3(bytes, track.sourceFormat, bitrate, (percent) => {
         setProgress({
           label: "Đang mã hoá MP3...",
           percent: 65 + percent * 0.35,
@@ -624,8 +670,8 @@ export function Downloader() {
 
               {tooLongForMp3 && !progress && (
                 <p className="quality-note warn">
-                  Video dài hơn {SITE.maxMp3DurationLabel}: trình duyệt có thể hết bộ nhớ khi mã hoá
-                  MP3. Nên dùng “Tải bản gốc”.
+                  Video dài hơn {SITE.maxMp3DurationLabel} và nguồn âm thanh là Opus/WebM nên
+                  chưa thể chuyển MP3. Hãy thử một video khác.
                 </p>
               )}
 
