@@ -10,6 +10,58 @@ const VISITOR_TIMEOUT_MS = 10_000;
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+// Optional YouTube account cookies. On datacenter IPs such as Vercel's,
+// YouTube answers anonymous requests with a bot check (`LOGIN_REQUIRED`).
+// A signed-in session passes that check, so the same code can keep serving
+// long videos from a hosted deployment.
+//
+// Accepted formats: a raw `Cookie` header, a JSON array/object exported by a
+// cookie extension, or the contents of a Netscape `cookies.txt` file.
+function normalizeCookie(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+
+  if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      const list = Array.isArray(parsed)
+        ? parsed
+        : (parsed as { cookies?: unknown } | null)?.cookies;
+
+      if (Array.isArray(list)) {
+        const pairs = list
+          .filter(
+            (item): item is { name: string; value: string } =>
+              Boolean(item) &&
+              typeof (item as { name?: unknown }).name === "string" &&
+              typeof (item as { value?: unknown }).value === "string",
+          )
+          .map((item) => `${item.name}=${item.value}`);
+        if (pairs.length > 0) return pairs.join("; ");
+      }
+    } catch {
+      // Not JSON, fall through to the text formats.
+    }
+  }
+
+  const lines = trimmed
+    .split(/\r?\n/)
+    .filter((line) => line.trim() && !line.trim().startsWith("#"));
+
+  if (lines.length > 0 && lines.every((line) => line.split("\t").length >= 7)) {
+    return lines
+      .map((line) => {
+        const parts = line.split("\t");
+        return `${parts[5]}=${parts[6]}`;
+      })
+      .join("; ");
+  }
+
+  return trimmed.replace(/\s*\r?\n\s*/g, " ").trim();
+}
+
+const YOUTUBE_COOKIE = normalizeCookie(process.env.YOUTUBE_COOKIE ?? "");
+
 export interface TrackInfo {
   videoId: string;
   title: string;
@@ -64,7 +116,9 @@ async function fetchVisitorFromPage(page: string): Promise<string | null> {
       "User-Agent": BROWSER_UA,
       "Accept-Language": "en-US,en;q=0.9",
       // Skip the EU consent interstitial, which omits the visitor id.
-      Cookie: "CONSENT=YES+cb; SOCS=CAI",
+      // When account cookies are configured, use them so the visitor id is
+      // bound to the signed-in account.
+      Cookie: YOUTUBE_COOKIE || "CONSENT=YES+cb; SOCS=CAI",
     },
     cache: "no-store",
     signal: AbortSignal.timeout(VISITOR_TIMEOUT_MS),
@@ -124,11 +178,12 @@ export async function getInnertube(): Promise<Innertube> {
 
       return Innertube.create({
         retrieve_player: true,
-        generate_session_locally: !visitorData,
+        generate_session_locally: YOUTUBE_COOKIE ? false : !visitorData,
         enable_session_cache: false,
         lang: "vi",
         location: "VN",
         ...(visitorData ? { visitor_data: visitorData } : {}),
+        ...(YOUTUBE_COOKIE ? { cookie: YOUTUBE_COOKIE } : {}),
       });
     })();
 
@@ -420,7 +475,11 @@ export async function resolveTrack(
 
       if (youtubeStatus === "LOGIN_REQUIRED") {
         throw new ResolveError(
-          `${reason ?? "YouTube yêu cầu xác minh bot."} Máy chủ đang chạy có thể bị YouTube chặn — hãy chạy ứng dụng trên máy cá nhân hoặc dùng IP khác.`,
+          `${reason ?? "YouTube yêu cầu xác minh bot."} ${
+            YOUTUBE_COOKIE
+              ? "Cookie YouTube đã hết hạn hoặc không hợp lệ — hãy cập nhật YOUTUBE_COOKIE hoặc dùng IP khác."
+              : "Máy chủ đang chạy có thể bị YouTube chặn — hãy chạy ứng dụng trên máy cá nhân hoặc dùng IP khác."
+          }`,
           422,
         );
       }
