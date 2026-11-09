@@ -1,4 +1,9 @@
-import { isVideoId, resolveTrack, ResolveError } from "@/lib/youtube";
+import {
+  isVideoId,
+  refreshYoutubeSession,
+  resolveTrack,
+  ResolveError,
+} from "@/lib/youtube";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -34,9 +39,18 @@ export async function GET(request: Request) {
     let upstream = await fetchFromCdn(resolved.url, upstreamRange);
 
     // A cached CDN URL can expire or get rejected. Re-resolve once and retry.
+    // If that still fails, the session's visitor id is being throttled, so
+    // rebuild it with a fresh visitor id before trying one last time.
     if (upstream.status === 403 || upstream.status === 410) {
       resolved = await resolveTrack(id, { force: true });
       upstream = await fetchFromCdn(resolved.url, upstreamRange);
+
+      if (upstream.status === 403 || upstream.status === 410) {
+        console.warn("[api/audio] refreshing YouTube session after 403", id);
+        await refreshYoutubeSession();
+        resolved = await resolveTrack(id, { force: true });
+        upstream = await fetchFromCdn(resolved.url, upstreamRange);
+      }
     }
 
     if (!upstream.ok && upstream.status !== 206) {

@@ -438,8 +438,8 @@ export function Downloader() {
     } catch (err) {
       setError(
         err instanceof Error
-          ? `${err.message} Bạn có thể thử "Tải bản gốc" thay thế.`
-          : "Không thể tạo file MP3. Bạn có thể thử tải bản gốc.",
+          ? err.message
+          : "Không thể tạo file MP3. Vui lòng thử lại.",
       );
       setPhase("ready");
       setProgress(null);

@@ -52,38 +52,59 @@ function preparePlatform() {
   platformReady = true;
 }
 
+const VISITOR_PAGES = [
+  "https://www.youtube.com/",
+  "https://m.youtube.com/",
+  "https://www.youtube.com/embed/dQw4w9WgXcQ",
+];
+
+async function fetchVisitorFromPage(page: string): Promise<string | null> {
+  const response = await fetch(page, {
+    headers: {
+      "User-Agent": BROWSER_UA,
+      "Accept-Language": "en-US,en;q=0.9",
+      // Skip the EU consent interstitial, which omits the visitor id.
+      Cookie: "CONSENT=YES+cb; SOCS=CAI",
+    },
+    cache: "no-store",
+    signal: AbortSignal.timeout(VISITOR_TIMEOUT_MS),
+  });
+
+  if (!response.ok) return null;
+
+  const html = await response.text();
+  const match =
+    /"visitorData":"([^"]+)"/.exec(html) ??
+    /VISITOR_DATA":"([^"]+)"/.exec(html) ??
+    /visitorData%22%3A%22([^%"]+)/.exec(html);
+
+  return match?.[1] ?? null;
+}
+
 /**
- * Fetch a real visitor id from the YouTube homepage. YouTube only serves
- * unthrottled media URLs to sessions backed by a genuine visitor id; locally
- * generated sessions are limited to the first ~1 MiB of every stream, which
- * makes any video longer than a few minutes fail with HTTP 403.
+ * Fetch a real visitor id from YouTube. YouTube only serves unthrottled media
+ * URLs to sessions backed by a genuine visitor id; locally generated sessions
+ * are limited to the first ~1 MiB of every stream, which makes any video
+ * longer than a few minutes fail with HTTP 403.
  */
 async function getVisitorData(): Promise<string | null> {
   if (visitorDataCache && visitorDataCache.expiresAt > Date.now()) {
     return visitorDataCache.value;
   }
 
+  const results = await Promise.allSettled(
+    VISITOR_PAGES.map((page) => fetchVisitorFromPage(page)),
+  );
+
   let value: string | null = null;
-
-  try {
-    const response = await fetch("https://www.youtube.com/", {
-      headers: {
-        "User-Agent": BROWSER_UA,
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-      cache: "no-store",
-      signal: AbortSignal.timeout(VISITOR_TIMEOUT_MS),
-    });
-
-    if (response.ok) {
-      const html = await response.text();
-      const match =
-        /"visitorData":"([^"]+)"/.exec(html) ??
-        /VISITOR_DATA":"([^"]+)"/.exec(html);
-      value = match?.[1] ?? null;
+  for (const result of results) {
+    if (result.status === "fulfilled" && result.value) {
+      value = result.value;
+      break;
     }
-  } catch (error) {
-    console.warn("[youtube] failed to fetch visitor data", error);
+    if (result.status === "rejected") {
+      console.warn("[youtube] failed to fetch visitor data", result.reason);
+    }
   }
 
   visitorDataCache = {
@@ -117,6 +138,29 @@ export async function getInnertube(): Promise<Innertube> {
   }
 
   return innertubePromise;
+}
+
+let refreshPromise: Promise<void> | null = null;
+
+/**
+ * Drop the cached Innertube session and visitor id, then build a new one.
+ * Called when YouTube rejects a media URL with 403: the most common cause is
+ * a session whose visitor id YouTube no longer accepts (or a fallback session
+ * that was created without a real one), so retrying with the same session
+ * would fail forever.
+ */
+export function refreshYoutubeSession(): Promise<void> {
+  if (!refreshPromise) {
+    innertubePromise = null;
+    visitorDataCache = null;
+    refreshPromise = getInnertube()
+      .then(() => undefined)
+      .finally(() => {
+        refreshPromise = null;
+      });
+  }
+
+  return refreshPromise;
 }
 
 export function isVideoId(value: string): boolean {
@@ -293,9 +337,37 @@ function remember(videoId: string, entry: ResolvedTrack) {
   }
 }
 
+const THROTTLE_PROBE_OFFSET = 1024 * 1024 + 1;
+
+/**
+ * YouTube serves a media URL that looks valid but only allows the first
+ * ~1 MiB when the session's visitor id is not accepted. Probe just past that
+ * boundary so a throttled URL is never cached or handed to the downloader.
+ */
+async function isMediaUrlThrottled(url: string, sizeBytes: number): Promise<boolean> {
+  if (!url) return false;
+  if (sizeBytes > 0 && sizeBytes <= THROTTLE_PROBE_OFFSET) return false;
+
+  try {
+    const response = await fetch(url, {
+      headers: { Range: `bytes=${THROTTLE_PROBE_OFFSET}-${THROTTLE_PROBE_OFFSET + 1}` },
+      cache: "no-store",
+      signal: AbortSignal.timeout(8_000),
+    });
+    await response.body?.cancel().catch(() => undefined);
+
+    if (response.status === 416) return false;
+    return response.status !== 206;
+  } catch (error) {
+    // Network hiccups should not be mistaken for throttle; let the download try.
+    console.warn("[youtube] media url probe failed", error);
+    return false;
+  }
+}
+
 export async function resolveTrack(
   videoId: string,
-  options: { force?: boolean } = {},
+  options: { force?: boolean; retried?: boolean } = {},
 ): Promise<ResolvedTrack & { fromCache: boolean }> {
   if (!isVideoId(videoId)) {
     throw new ResolveError("ID video không hợp lệ.", 400);
@@ -440,6 +512,32 @@ export async function resolveTrack(
     url: mediaUrl,
     cachedAt: Date.now(),
   };
+
+  if (await isMediaUrlThrottled(entry.url, entry.info.sizeBytes)) {
+    if (!options.retried) {
+      console.warn("[youtube] media url throttled, refreshing session", videoId);
+      await refreshYoutubeSession();
+      return resolveTrack(videoId, { force: true, retried: true });
+    }
+
+    console.warn("[youtube] media url still throttled, trying Invidious", videoId);
+    const invidious = await resolveInvidiousTrack(videoId);
+
+    if (invidious) {
+      const fallback: ResolvedTrack = {
+        info: invidious.info,
+        url: invidious.url,
+        cachedAt: Date.now(),
+      };
+      remember(videoId, fallback);
+      return { ...fallback, fromCache: false };
+    }
+
+    throw new ResolveError(
+      "YouTube đang giới hạn tốc độ tải cho phiên hiện tại. Vui lòng thử lại sau ít phút.",
+      503,
+    );
+  }
 
   remember(videoId, entry);
 
