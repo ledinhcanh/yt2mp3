@@ -1,4 +1,5 @@
 import { createMp3Encoder } from "wasm-media-encoders";
+import { stripMp3Metadata } from "./mp3-tags";
 
 type EncodeRequest = {
   id: number;
@@ -70,7 +71,14 @@ scope.addEventListener("message", (event: MessageEvent<EncodeRequest>) => {
 
       append(encoder.finalize());
 
-      const buffer = output.buffer.slice(0, position) as ArrayBuffer;
+      // Strip ID3/APE tags (and any leading non-frame bytes) so downloaded
+      // files never carry cover art or metadata that can crash strict car
+      // head units. Audio frames themselves are left untouched.
+      const cleaned = stripMp3Metadata(output.subarray(0, position));
+      const buffer = cleaned.buffer.slice(
+        cleaned.byteOffset,
+        cleaned.byteOffset + cleaned.byteLength,
+      ) as ArrayBuffer;
       scope.postMessage({ id, type: "done", percent: 100, buffer }, [buffer]);
     })
     .catch((error: unknown) => {

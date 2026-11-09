@@ -323,7 +323,7 @@ export function Downloader() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [track, setTrack] = useState<Track | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [bitrate, setBitrate] = useState<Bitrate>(192);
+  const [bitrate, setBitrate] = useState<Bitrate>(320);
   const [progress, setProgress] = useState<Progress>(null);
 
   const busy = phase === "loading" || phase === "working";
@@ -677,7 +677,8 @@ export function Downloader() {
 
               <p className="quality-note">
                 Nguồn âm thanh gốc của YouTube thường chỉ ~128–160 kbps. Bitrate cao hơn giúp giữ
-                nguyên chất lượng khi biên tập, không tạo thêm chi tiết.
+                nguyên chất lượng khi biên tập, không tạo thêm chi tiết. File MP3 được tạo không
+                nhúng ảnh bìa hay thẻ ID3 để tương thích đầu xe.
               </p>
             </div>
           </div>
