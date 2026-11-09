@@ -1,4 +1,5 @@
 import { Innertube, Platform } from "youtubei.js";
+import { getPoToken } from "@/lib/potoken";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,19 +26,23 @@ async function getVisitorData(): Promise<string | null> {
         cache: "no-store",
         signal: AbortSignal.timeout(10_000),
       });
-      if (!response.ok) return { status: response.status, visitor: null };
+      if (!response.ok) return null;
       const html = await response.text();
       const match =
         /"visitorData":"([^"]+)"/.exec(html) ??
         /VISITOR_DATA":"([^"]+)"/.exec(html);
-      return { status: response.status, visitor: match?.[1] ?? null };
+      return match?.[1] ?? null;
     }),
   );
 
-  return results
-    .map((result) => (result.status === "fulfilled" ? result.value : null))
-    .find((value) => value?.visitor)?.visitor ?? null;
+  return (
+    results
+      .map((result) => (result.status === "fulfilled" ? result.value : null))
+      .find((value) => value) ?? null
+  );
 }
+
+type ClientSpec = { name: string; token?: string | null };
 
 export async function GET(request: Request) {
   const id = new URL(request.url).searchParams.get("id") ?? "dQw4w9WgXcQ";
@@ -52,10 +57,8 @@ export async function GET(request: Request) {
     Platform.shim.eval = async (data) => new Function(data.output)();
 
     const visitor = await getVisitorData();
-    report.visitorMs = Date.now() - started;
     report.visitor = visitor ? `${visitor.slice(0, 12)}...` : null;
 
-    const createStarted = Date.now();
     const yt = await Innertube.create({
       retrieve_player: true,
       generate_session_locally: !visitor,
@@ -64,56 +67,84 @@ export async function GET(request: Request) {
       location: "VN",
       ...(visitor ? { visitor_data: visitor } : {}),
     });
-    report.createMs = Date.now() - createStarted;
 
-    const infoStarted = Date.now();
-    const info = await yt.getInfo(id, { client: "VISIONOS" });
-    report.infoMs = Date.now() - infoStarted;
-    report.playability = info.playability_status?.status;
-    report.reason = info.playability_status?.reason ?? null;
-
-    const formats = (info.streaming_data?.adaptive_formats ?? []).filter(
-      (format) => format.has_audio && !format.has_video,
-    );
-    report.audioFormats = formats.length;
-    formats.sort((a, b) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0));
-    const chosen = formats[0];
-
-    if (!chosen) {
-      return Response.json(report);
-    }
-
-    report.mime = chosen.mime_type;
-    report.bitrate = chosen.bitrate;
-    report.contentLength = chosen.content_length;
-
-    let url = "";
+    let webToken: string | null = null;
+    const tokenStarted = Date.now();
     try {
-      url = await chosen.decipher(yt.session.player);
+      webToken = await getPoToken(id);
     } catch (error) {
-      report.decipherError = String(error);
+      report.tokenError = String(error);
     }
-    if (!url) url = chosen.url ?? "";
-    report.hasUrl = Boolean(url);
+    report.tokenMs = Date.now() - tokenStarted;
+    report.token = webToken ? "yes" : null;
 
-    const parsed = new URL(url);
-    report.host = parsed.host;
-    report.n = parsed.searchParams.get("n");
-    report.pot = parsed.searchParams.has("pot");
-    report.ip = parsed.searchParams.get("ip");
-    report.c = parsed.searchParams.get("c");
+    const clients: ClientSpec[] = [
+      { name: "VISIONOS" },
+      { name: "MWEB", token: webToken },
+      { name: "WEB", token: webToken },
+      { name: "TV" },
+      { name: "TV_SIMPLY" },
+      { name: "TV_EMBEDDED" },
+      { name: "WEB_EMBEDDED" },
+      { name: "IOS" },
+      { name: "ANDROID_VR" },
+    ];
 
-    const offset = 1024 * 1024 + 1;
-    const probeStarted = Date.now();
-    const response = await fetch(url, {
-      headers: { Range: `bytes=${offset}-${offset + 1}` },
-      cache: "no-store",
-      signal: AbortSignal.timeout(15_000),
-    });
-    report.probeMs = Date.now() - probeStarted;
-    report.probeStatus = response.status;
-    report.probeRange = response.headers.get("content-range");
-    await response.body?.cancel().catch(() => undefined);
+    const results: Record<string, unknown>[] = [];
+    for (const client of clients) {
+      const clientStarted = Date.now();
+      const entry: Record<string, unknown> = { client: client.name };
+      try {
+        const info = await yt.getInfo(id, {
+          client: client.name as never,
+          ...(client.token ? { po_token: client.token } : {}),
+        });
+        const formats = (info.streaming_data?.adaptive_formats ?? []).filter(
+          (format) => format.has_audio && !format.has_video,
+        );
+        entry.status = info.playability_status?.status;
+        entry.formats = formats.length;
+        formats.sort((a, b) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0));
+        const chosen = formats[0];
+        if (chosen) {
+          entry.mime = chosen.mime_type;
+          entry.size = chosen.content_length;
+        }
+        if (chosen && !report.probe) {
+          let url = "";
+          try {
+            url = await chosen.decipher(yt.session.player);
+          } catch {}
+          if (!url) url = chosen.url ?? "";
+          if (url) {
+            const parsed = new URL(url);
+            const offset = 1024 * 1024 + 1;
+            const probeStarted = Date.now();
+            const response = await fetch(url, {
+              headers: { Range: `bytes=${offset}-${offset + 1}` },
+              cache: "no-store",
+              signal: AbortSignal.timeout(15_000),
+            });
+            report.probe = {
+              client: client.name,
+              host: parsed.host,
+              n: parsed.searchParams.get("n"),
+              pot: parsed.searchParams.has("pot"),
+              status: response.status,
+              ms: Date.now() - probeStarted,
+            };
+            await response.body?.cancel().catch(() => undefined);
+          }
+        }
+      } catch (error) {
+        entry.status = "ERROR";
+        entry.error = String(error).slice(0, 160);
+      }
+      entry.ms = Date.now() - clientStarted;
+      results.push(entry);
+    }
+
+    report.clients = results;
   } catch (error) {
     report.error = error instanceof Error ? error.message : String(error);
   }
