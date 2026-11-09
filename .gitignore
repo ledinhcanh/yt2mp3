@@ -36,3 +36,6 @@ yarn-error.log*
 
 # typescript
 *.tsbuildinfo
+
+# workbuddy session data (memory logs, not source)
+/.workbuddy-ai/
