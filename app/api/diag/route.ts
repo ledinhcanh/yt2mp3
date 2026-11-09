@@ -152,3 +152,5 @@ export async function GET(request: Request) {
   report.totalMs = Date.now() - started;
   return Response.json(report);
 }
+
+export const preferredRegion = "sin1";
