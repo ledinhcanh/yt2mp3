@@ -417,6 +417,14 @@ export async function resolveTrack(
 
     if (resolvedYoutube && youtubeStatus !== "OK") {
       const reason = resolvedYoutube.info.playability_status?.reason;
+
+      if (youtubeStatus === "LOGIN_REQUIRED") {
+        throw new ResolveError(
+          `${reason ?? "YouTube yêu cầu xác minh bot."} Máy chủ đang chạy có thể bị YouTube chặn — hãy chạy ứng dụng trên máy cá nhân hoặc dùng IP khác.`,
+          422,
+        );
+      }
+
       if (reason) throw new ResolveError(reason, 422);
     }
 

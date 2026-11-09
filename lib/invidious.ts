@@ -43,6 +43,31 @@ function pickThumbnail(video: InvidiousVideo): string {
   return sorted[0]?.url ?? "";
 }
 
+const RANGE_PROBE_OFFSET = 1024 * 1024 + 1;
+
+/**
+ * Several public Invidious instances hand out media URLs that are bound to
+ * their own IP (or redirect to googlevideo with a mismatched `ip` parameter),
+ * so the URL fails with 403 when a different server fetches it. Probe past the
+ * 1 MiB boundary before trusting a URL.
+ */
+async function isRangeReadable(url: string): Promise<boolean> {
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Range: `bytes=${RANGE_PROBE_OFFSET}-${RANGE_PROBE_OFFSET + 1}`,
+      },
+      cache: "no-store",
+      signal: AbortSignal.timeout(10_000),
+    });
+    await response.body?.cancel().catch(() => undefined);
+    return response.status === 206 || response.status === 416;
+  } catch (error) {
+    console.warn("[invidious] media probe failed", error);
+    return false;
+  }
+}
+
 function isAudioFormat(format: InvidiousFormat): boolean {
   return (
     typeof format.url === "string" &&
@@ -97,6 +122,11 @@ export async function resolveInvidiousTrack(videoId: string): Promise<InvidiousT
       const type = chosen.type ?? "audio/mp4";
       const title = video.title?.trim() || "Không có tiêu đề";
       const thumbnail = pickThumbnail(video);
+
+      if (!(await isRangeReadable(chosen.url as string))) {
+        console.warn("[invidious] media url is not readable", instance, videoId);
+        continue;
+      }
 
       const info: TrackInfo = {
         videoId,
